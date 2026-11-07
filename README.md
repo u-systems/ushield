@@ -150,4 +150,4 @@ The REST API (and matching Web UI) exposes complete control over the sandbox eng
 
 ## License
 
-Developed under GPL-2.0 (Kernel Module) and MIT (User-space Daemon).
+Developed under GPL-2.0 (Kernel Module) and MIT (User-space Daemon). Developed independently by [tralsesec](https://github.com/tralsesec) under [µSystems](https://github.com/u-systems).
