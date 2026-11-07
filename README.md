@@ -140,7 +140,7 @@ The REST API (and matching Web UI) exposes complete control over the sandbox eng
 - [x] **Phase 3:** Zero-copy `mmap` ring buffer telemetry transport.
 - [x] **Phase 4:** PrivSep daemon split, process hierarchy identity registry, and path-based target registration (`USHIELD_IOC_REGISTER_TARGET`).
 - [ ] **Phase 5:** Universal Policy Matrix `(ALLOW | DENY | HOOK) | LOG` & eBPF LSM syscall interception with Ring 3 Upcall Hook Dispatcher (`USHIELD_IOC_REGISTER_HOOK` + `ushield_hook_ctx` loop).
-- [ ] **Phase 6:** Layered Environment Engine (Base Templates + Delta Layer Mount/Env stacker).
+- [x] **Phase 6:** Layered Environment Engine (Base Templates + Delta Layer Mount/Env stacker).
 - [ ] **Phase 7:** Synthetic Kernel Emulation & Inline Fault Injection Engine (`DENY_ERRNO`, `EMULATE`).
 - [ ] **Phase 8:** Ring 0 Target Introspection (VMA mmap dumping, FD tapping, atomic Pause/Resume).
 - [ ] **Phase 9 (Future):** *Behavioral Sequence State Machines* — Ring 0 workflow triggers (e.g. stateful hot-patching when Syscall A is followed by Syscall B).
