@@ -144,7 +144,7 @@ The REST API (and matching Web UI) exposes complete control over the sandbox eng
 - [ ] **Phase 7:** Synthetic Kernel Emulation & Inline Fault Injection Engine (`DENY_ERRNO`, `EMULATE`).
 - [ ] **Phase 8:** Ring 0 Target Introspection (VMA mmap dumping, FD tapping, atomic Pause/Resume).
 - [ ] **Phase 9 (Future):** *Behavioral Sequence State Machines* — Ring 0 workflow triggers (e.g. stateful hot-patching when Syscall A is followed by Syscall B).
-- [ ] **Phase 10 (Future):** HTTP library replaced by [`asmhttp`](https://github.com/tralsesec/asmhttp) when production-ready.
+- [ ] **Phase 10 (Future):** HTTP library replaced by [`uhttp`](https://github.com/u-systems/uhttp) when production-ready.
 
 ---
 
