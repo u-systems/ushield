@@ -12,6 +12,7 @@
 #include <linux/module.h>
 #include <linux/pid.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -39,7 +40,17 @@ struct ushield_policy {
 
 struct ushield_target_rule {
     char binary_path[USHIELD_PATH_MAX];
-    uint32_t permissions;
+    uint32_t base_template;
+    uint32_t default_permissions;
+
+    /* Edit Delta Stack */
+    struct ushield_delta_layer layers[USHIELD_MAX_DELTA_LAYERS];
+    size_t layer_count;
+
+    /* Hot-Patched Resource Rules */
+    struct ushield_resource_patch patches[USHIELD_MAX_RESOURCE_PATCHES];
+    size_t patch_count;
+
     pid_t creator_pid;
     bool active;
 };
@@ -61,9 +72,8 @@ static struct ushield_ring_buffer *ring_buf = NULL;
 static struct ushield_registry registry;
 
 static void ushield_produce_event(uint32_t type, uint32_t syscall_nr, uint8_t action) {
-    if (!ring_buf) {
+    if (!ring_buf)
         return;
-    }
 
     uint32_t idx = ring_buf->head & (USHIELD_RING_CAPACITY - 1);
     struct ushield_event *ev = &ring_buf->events[idx];
@@ -79,6 +89,58 @@ static void ushield_produce_event(uint32_t type, uint32_t syscall_nr, uint8_t ac
     ring_buf->head++;
 }
 
+static bool is_pid_alive(pid_t pid) {
+    bool alive = false;
+    if (pid <= 0)
+        return false;
+
+    rcu_read_lock();
+    if (pid_task(find_vpid(pid), PIDTYPE_PID) != NULL) {
+        alive = true;
+    }
+    rcu_read_unlock();
+
+    return alive;
+}
+
+static int ushield_pause_process(pid_t target_pid) {
+    struct task_struct *task;
+    int ret = -ESRCH;
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(target_pid), PIDTYPE_PID);
+    if (task) {
+        get_task_struct(task);
+        rcu_read_unlock();
+
+        ret = send_sig(SIGSTOP, task, 0);
+        put_task_struct(task);
+        pr_info("Target process PID %d PAUSED (SIGSTOP sent)\n", target_pid);
+        return ret;
+    }
+    rcu_read_unlock();
+    return ret;
+}
+
+static int ushield_resume_process(pid_t target_pid) {
+    struct task_struct *task;
+    int ret = -ESRCH;
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(target_pid), PIDTYPE_PID);
+    if (task) {
+        get_task_struct(task);
+        rcu_read_unlock();
+
+        ret = send_sig(SIGCONT, task, 0);
+        put_task_struct(task);
+        pr_info("Target process PID %d RESUMED (SIGCONT sent)\n", target_pid);
+        return ret;
+    }
+    rcu_read_unlock();
+    return ret;
+}
+
 static int ushield_open(struct inode *inode, struct file *file) {
     const struct cred *cred = current_cred();
     pr_info("/dev/ushield opened by PID %d (UID: %d, EUID: %d)\n", current->pid, cred->uid.val,
@@ -92,18 +154,15 @@ static int ushield_release(struct inode *inode, struct file *file) {
     unsigned long flags;
     spin_lock_irqsave(&registry.lock, flags);
 
-    // 1. Reset Supervisor PID on master exit
     if (registry.master_daemon_pid == current->pid) {
         registry.master_daemon_pid = 0;
         pr_info("Master Supervisor PID %d unregistered on close\n", current->pid);
     }
 
-    // 2. Compact policy registry by removing closed/exited PIDs
     size_t i = 0;
     while (i < registry.count) {
         if (registry.policies[i].creator_pid == current->pid) {
-            pr_info("Cleaning up sealed policy %d for exited creator PID %d\n", (int)i,
-                    current->pid);
+            pr_info("Cleaning up sealed policy %zu for exited creator PID %d\n", i, current->pid);
             registry.policies[i] = registry.policies[registry.count - 1];
             registry.count--;
         } else {
@@ -115,20 +174,6 @@ static int ushield_release(struct inode *inode, struct file *file) {
 
     pr_info("/dev/ushield closed by PID %d\n", current->pid);
     return 0;
-}
-
-static bool is_pid_alive(pid_t pid) {
-    bool alive = false;
-    if (pid <= 0)
-        return false;
-
-    rcu_read_lock();
-    if (pid_task(find_vpid(pid), PIDTYPE_PID) != NULL) {
-        alive = true;
-    }
-    rcu_read_unlock();
-
-    return alive;
 }
 
 static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
@@ -149,7 +194,6 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     case USHIELD_IOC_REGISTER_SUPERVISOR: {
         pid_t pid = current->pid;
 
-        // 1. Root Credential Check
         if (current_cred()->uid.val != 0) {
             pr_warn("PID %d failed supervisor registration (Requires UID 0)\n", pid);
             return -EPERM;
@@ -158,7 +202,6 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
         unsigned long flags;
         spin_lock_irqsave(&registry.lock, flags);
 
-        // 2. Existing Supervisor Active Check
         if (registry.master_daemon_pid) {
             bool active = is_pid_alive(registry.master_daemon_pid);
             if (active && registry.master_daemon_pid != pid) {
@@ -166,7 +209,7 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
                         "active (PID %d)\n",
                         pid, registry.master_daemon_pid);
                 spin_unlock_irqrestore(&registry.lock, flags);
-                return -EBUSY; // Resource Busy
+                return -EBUSY;
             }
 
             if (!active) {
@@ -175,7 +218,6 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
             }
         }
 
-        // 3. Register New Supervisor PID
         registry.master_daemon_pid = pid;
         spin_unlock_irqrestore(&registry.lock, flags);
 
@@ -212,13 +254,16 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     }
 
     case USHIELD_IOC_REGISTER_TARGET: {
-        struct ushield_target_config config;
-        if (copy_from_user(&config, (struct ushield_target_config __user *)arg, sizeof(config))) {
+        struct ushield_target_config *config = kmalloc(sizeof(*config), GFP_KERNEL);
+        if (!config)
+            return -ENOMEM;
+
+        if (copy_from_user(config, (struct ushield_target_config __user *)arg, sizeof(*config))) {
+            kfree(config);
             return -EFAULT;
         }
 
-        // Make sure path ends on \0
-        config.binary_path[USHIELD_PATH_MAX - 1] = '\0';
+        config->binary_path[USHIELD_PATH_MAX - 1] = '\0';
 
         unsigned long flags;
         int status = 0;
@@ -227,46 +272,49 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 
         if (current->pid != registry.master_daemon_pid) {
             spin_unlock_irqrestore(&registry.lock, flags);
-            pr_warn("PID %d denied registering target rule (Not Master Supervirsor)\n",
+            pr_warn("PID %d denied registering target rule (Not Master Supervisor)\n",
                     current->pid);
+            kfree(config);
             return -EPERM;
         }
 
-        // Check if rule already exists
         bool exists = false;
         for (size_t i = 0; i < registry.rule_count; i++) {
             if (registry.target_rules[i].active &&
-                strncmp(registry.target_rules[i].binary_path, config.binary_path,
+                strncmp(registry.target_rules[i].binary_path, config->binary_path,
                         USHIELD_PATH_MAX) == 0) {
-                registry.target_rules[i].permissions = config.permissions;
+                registry.target_rules[i].default_permissions = config->default_perm_mask;
+                registry.target_rules[i].base_template = config->base_template;
                 exists = true;
                 pr_info("Updated target execution rule for binary '%s' (Perms: 0x%08X)\n",
-                        config.binary_path, config.permissions);
+                        config->binary_path, config->default_perm_mask);
                 break;
             }
         }
 
         if (!exists) {
-            if (registry.rule_count >= MAX_TARGET_RULES) {
+            if (registry.rule_count < MAX_TARGET_RULES) {
+                struct ushield_target_rule *rule = &registry.target_rules[registry.rule_count];
+                memset(rule, 0, sizeof(*rule));
+
+                strscpy(rule->binary_path, config->binary_path, sizeof(rule->binary_path));
+                rule->base_template = config->base_template;
+                rule->default_permissions = config->default_perm_mask;
+                rule->creator_pid = current->pid;
+                rule->active = true;
+                registry.rule_count++;
+
+                pr_info("Registered target execution rule for binary '%s' (Perms: 0x%08X)\n",
+                        config->binary_path, config->default_perm_mask);
+            } else {
                 status = -ENOMEM;
-                goto end;
             }
-            struct ushield_target_rule *rule = &registry.target_rules[registry.rule_count];
-
-            strscpy(rule->binary_path, config.binary_path, sizeof(rule->binary_path));
-            rule->permissions = config.permissions;
-            rule->creator_pid = current->pid;
-            rule->active = true;
-            registry.rule_count++;
-
-            pr_info("Registered target execution rule for binary '%s' (Perms: 0x%08X)\n",
-                    config.binary_path, config.permissions);
         }
 
-    end:
         spin_unlock_irqrestore(&registry.lock, flags);
+        kfree(config);
 
-        if (!status) {
+        if (status == 0) {
             ushield_produce_event(USHIELD_EVENT_PROCESS_SEAL, 0, 0);
         }
 
@@ -274,13 +322,16 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     }
 
     case USHIELD_IOC_UNREGISTER_TARGET: {
-        struct ushield_target_config config;
-        if (copy_from_user(&config, (struct ushield_target_config __user *)arg, sizeof(config))) {
+        struct ushield_target_config *config = kmalloc(sizeof(*config), GFP_KERNEL);
+        if (!config)
+            return -ENOMEM;
+
+        if (copy_from_user(config, (struct ushield_target_config __user *)arg, sizeof(*config))) {
+            kfree(config);
             return -EFAULT;
         }
 
-        // Make sure last char is \0
-        config.binary_path[USHIELD_PATH_MAX - 1] = '\0';
+        config->binary_path[USHIELD_PATH_MAX - 1] = '\0';
 
         unsigned long flags;
         bool found = false;
@@ -289,57 +340,169 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 
         if (current->pid != registry.master_daemon_pid) {
             spin_unlock_irqrestore(&registry.lock, flags);
+            kfree(config);
             return -EPERM;
         }
 
         for (size_t i = 0; i < registry.rule_count; i++) {
             if (registry.target_rules[i].active &&
-                strncmp(registry.target_rules[i].binary_path, config.binary_path,
+                strncmp(registry.target_rules[i].binary_path, config->binary_path,
                         USHIELD_PATH_MAX) == 0) {
-                // Fast O(1) swap-with-last array item removal
                 registry.target_rules[i] = registry.target_rules[registry.rule_count - 1];
+                memset(&registry.target_rules[registry.rule_count - 1], 0,
+                       sizeof(struct ushield_target_rule));
                 registry.rule_count--;
                 found = true;
-                pr_info("Unregistered target execution rule for binary '%s'\n", config.binary_path);
+                pr_info("Unregistered target execution rule for binary '%s'\n",
+                        config->binary_path);
                 break;
             }
         }
 
         spin_unlock_irqrestore(&registry.lock, flags);
+        kfree(config);
 
         return found ? 0 : -ENOENT;
     }
 
-    case USHIELD_IOC_GET_POLICY: {
-        struct ushield_policy policy;
-        if (copy_from_user(&policy, (struct ushield_policy __user *)arg, sizeof(policy))) {
+    case USHIELD_IOC_PAUSE_TARGET: {
+        uint32_t target_pid = 0;
+        if (copy_from_user(&target_pid, (uint32_t __user *)arg, sizeof(target_pid))) {
+            return -EFAULT;
+        }
+
+        if (current->pid != registry.master_daemon_pid) {
+            return -EPERM;
+        }
+
+        return ushield_pause_process((pid_t)target_pid);
+    }
+
+    case USHIELD_IOC_RESUME_TARGET: {
+        uint32_t target_pid = 0;
+        if (copy_from_user(&target_pid, (uint32_t __user *)arg, sizeof(target_pid))) {
+            return -EFAULT;
+        }
+
+        if (current->pid != registry.master_daemon_pid) {
+            return -EPERM;
+        }
+
+        return ushield_resume_process((pid_t)target_pid);
+    }
+
+    case USHIELD_IOC_PUSH_DELTA: {
+        struct ushield_delta_layer *layer = kmalloc(sizeof(*layer), GFP_KERNEL);
+        if (!layer)
+            return -ENOMEM;
+
+        if (copy_from_user(layer, (struct ushield_delta_layer __user *)arg, sizeof(*layer))) {
+            kfree(layer);
             return -EFAULT;
         }
 
         unsigned long flags;
-        bool found = false;
+        int status = -ENOENT;
 
         spin_lock_irqsave(&registry.lock, flags);
-        for (size_t i = 0; i < registry.count; i++) {
-            if (registry.policies[i].active && registry.policies[i].pid == (pid_t)policy.pid) {
-                /* Scoped Identity Check: Creator or Master */
-                if (current->pid == registry.policies[i].creator_pid ||
-                    current->pid == registry.master_daemon_pid) {
-                    policy.permissions = registry.policies[i].permissions;
-                    found = true;
+
+        if (current->pid != registry.master_daemon_pid) {
+            spin_unlock_irqrestore(&registry.lock, flags);
+            kfree(layer);
+            return -EPERM;
+        }
+
+        for (size_t i = 0; i < registry.rule_count; i++) {
+            if (registry.target_rules[i].active) {
+                if (registry.target_rules[i].layer_count < USHIELD_MAX_DELTA_LAYERS) {
+                    size_t idx = registry.target_rules[i].layer_count;
+                    registry.target_rules[i].layers[idx] = *layer;
+                    registry.target_rules[i].layers[idx].layer_id = (uint32_t)idx;
+                    registry.target_rules[i].layer_count++;
+
+                    pr_info(
+                        "Pushed Edit Delta Layer %zu to target binary '%s' (%u mounts, %u envs)\n",
+                        idx, registry.target_rules[i].binary_path, layer->mount_count,
+                        layer->env_count);
+                    status = 0;
+                } else {
+                    status = -ENOMEM;
                 }
                 break;
             }
         }
-        spin_unlock_irqrestore(&registry.lock, flags);
 
-        if (found) {
-            if (copy_to_user((struct ushield_policy __user *)arg, &policy, sizeof(policy))) {
-                return -EFAULT;
-            }
-            return 0;
+        spin_unlock_irqrestore(&registry.lock, flags);
+        kfree(layer);
+        return status;
+    }
+
+    case USHIELD_IOC_PATCH_RESOURCE: {
+        struct ushield_resource_patch *patch = kmalloc(sizeof(*patch), GFP_KERNEL);
+        if (!patch)
+            return -ENOMEM;
+
+        if (copy_from_user(patch, (struct ushield_resource_patch __user *)arg, sizeof(*patch))) {
+            kfree(patch);
+            return -EFAULT;
         }
-        return -EPERM;
+
+        patch->binary_path[USHIELD_PATH_MAX - 1] = '\0';
+        patch->resource_name[USHIELD_PATH_MAX - 1] = '\0';
+
+        unsigned long flags;
+        int status = -ENOENT;
+
+        spin_lock_irqsave(&registry.lock, flags);
+
+        if (current->pid != registry.master_daemon_pid) {
+            spin_unlock_irqrestore(&registry.lock, flags);
+            kfree(patch);
+            return -EPERM;
+        }
+
+        for (size_t i = 0; i < registry.rule_count; i++) {
+            if (registry.target_rules[i].active &&
+                strncmp(registry.target_rules[i].binary_path, patch->binary_path,
+                        USHIELD_PATH_MAX) == 0) {
+
+                bool updated = false;
+                for (size_t j = 0; j < registry.target_rules[i].patch_count; j++) {
+                    if (registry.target_rules[i].patches[j].resource_type == patch->resource_type &&
+                        registry.target_rules[i].patches[j].resource_id == patch->resource_id) {
+                        registry.target_rules[i].patches[j] = *patch;
+                        updated = true;
+                        pr_info(
+                            "Hot-patched existing Resource Rule (Type: %u, ID: %llu) for '%s'\n",
+                            patch->resource_type, (unsigned long long)patch->resource_id,
+                            patch->binary_path);
+                        break;
+                    }
+                }
+
+                if (!updated) {
+                    if (registry.target_rules[i].patch_count < USHIELD_MAX_RESOURCE_PATCHES) {
+                        size_t p_idx = registry.target_rules[i].patch_count;
+                        registry.target_rules[i].patches[p_idx] = *patch;
+                        registry.target_rules[i].patch_count++;
+                        pr_info(
+                            "Added new Hot-Patched Resource Rule (Type: %u, ID: %llu) for '%s'\n",
+                            patch->resource_type, (unsigned long long)patch->resource_id,
+                            patch->binary_path);
+                        status = 0;
+                    } else {
+                        status = -ENOMEM;
+                    }
+                } else {
+                    status = 0;
+                }
+                break;
+            }
+        }
+
+        spin_unlock_irqrestore(&registry.lock, flags);
+        kfree(patch);
+        return status;
     }
 
     default:
@@ -391,6 +554,7 @@ static int __init ushield_init(void) {
 
     spin_lock_init(&registry.lock);
     registry.count = 0;
+    registry.rule_count = 0;
     registry.master_daemon_pid = 0;
 
     ring_buf = kmalloc(sizeof(struct ushield_ring_buffer), GFP_KERNEL);
