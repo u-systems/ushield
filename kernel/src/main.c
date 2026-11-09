@@ -215,8 +215,8 @@ static inline int __configure_rule_add(uint32_t rule_id, uint32_t *rules_count,
     }
 
     // Make space for rule and insert!
-    for (size_t i = *rules_count; i >= rule_id; i--) {
-        rules[i + 1] = rules[i];
+    for (size_t i = *rules_count; i > rule_id; i--) {
+        rules[i] = rules[i - 1];
     }
 
     rules[rule_id] = rule;
@@ -622,6 +622,7 @@ static int ushield_container_create(ushield_container_t *container) {
 
     unsigned long flags;
     spin_lock_irqsave(&registry.lock, flags);
+    ptr->id = registry.containers_count;
     registry.containers[registry.containers_count] = ptr;
     registry.containers_count++;
     spin_unlock_irqrestore(&registry.lock, flags);
@@ -659,7 +660,7 @@ static int ushield_container_stop(uint32_t cid) {
 
     ushield_container_t *container = registry.containers[cid];
     for (size_t i = 0; i < container->processes_count; i++)
-        ushield_process_stop(container->id, container->processes[i]->pid);
+        ushield_process_stop(container->id, i);
     return 0;
 }
 
