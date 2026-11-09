@@ -140,10 +140,11 @@ typedef struct ushield_container {
     uint32_t base;            // Base Container.
     ushield_exec_info_t info; // Activity.
     uint32_t processes_count; // Currently registered processes.
+    uint32_t rules_count;     // Currently active / applied rules.
     pid_t owner;              // Owner's PID (whoever created this).
     ushield_delta_layer_t delta_layers[USHIELD_MAX_DELTA_LAYERS]; // Delta layers.
     ushield_process_t *processes[USHIELD_MAX_CHILDREN];           // All current processes sealed.
-    ushield_rule_t rules[USHIELD_MAX_RULES];                      // Rules.
+    ushield_rule_t *rules[USHIELD_MAX_RULES];                     // Rules.
 } ushield_container_t;
 
 /* IOCTL Command Definitions */
@@ -165,20 +166,23 @@ typedef struct ushield_container {
 #define USHIELD_EVENT_MESSAGE_SIZE 256
 
 typedef enum ushield_event_type {
-    USHIELD_EVENT_CONTAINER_REGISTER = 1,
-    USHIELD_EVENT_CONTAINER_START = 2,
+    USHIELD_EVENT_CONTAINER_CREATE = 0,
+    USHIELD_EVENT_CONTAINER_START = 1,
+    USHIELD_EVENT_CONTAINER_PAUSE = 2,
     USHIELD_EVENT_CONTAINER_STOP = 3,
-    USHIELD_EVENT_CONTAINER_UNREGISTER = 4,
-    USHIELD_EVENT_CONTAINER_CONFIGURE = 5,
-    USHIELD_EVENT_CONTAINER_READ = 6,
-    USHIELD_EVENT_CONTAINER_WRITE = 7,
-    USHIELD_EVENT_CONTAINER_EXECUTE = 8,
-    USHIELD_EVENT_CONTAINER_REGISTER_PROCESS = 9,
-    USHIELD_EVENT_CONTAINER_UNREGISTER_PROCESS = 10,
+    USHIELD_EVENT_CONTAINER_DELETE = 4,
+    USHIELD_EVENT_CONTAINER_DUMP = 5,
+    USHIELD_EVENT_CONTAINER_CONFIGURE = 6,
+    USHIELD_EVENT_CONTAINER_READ = 7,
+    USHIELD_EVENT_CONTAINER_WRITE = 8,
+    USHIELD_EVENT_CONTAINER_EXECUTE = 9,
 
-    USHIELD_EVENT_PROCESS_START = 12,
+    USHIELD_EVENT_PROCESS_CREATE = 10,
+    USHIELD_EVENT_PROCESS_START = 11,
+    USHIELD_EVENT_PROCESS_PAUSE = 12,
     USHIELD_EVENT_PROCESS_STOP = 13,
-    USHIELD_EVENT_PROCESS_CONFIGURE = 14,
+    USHIELD_EVENT_PROCESS_DUMP = 14,
+    USHIELD_EVENT_PROCESS_CONFIGURE = 15,
 
     USHIELD_EVENT_MASTER_REGISTER = 21,
     USHIELD_EVENT_MASTER_UNREGISTER = 22,
@@ -188,6 +192,8 @@ typedef enum ushield_event_type {
     USHIELD_EVENT_REQ_POLICY = 33,
     USHIELD_EVENT_REQ_OPEN_FD = 34,
     USHIELD_EVENT_REQ_CLOSE_FD = 35,
+    USHIELD_EVENT_REQ_INITIALIZE = 36,
+    USHIELD_EVENT_REQ_UNINITIALIZE = 37,
 
     USHIELD_EVENT_ATTENTION = 99, // Illegal action!
 } ushield_event_type_t;
@@ -215,6 +221,11 @@ struct ushield_ring_buffer {
     uint32_t capacity;
     uint32_t flags;
     struct ushield_event events[USHIELD_RING_CAPACITY];
+};
+
+struct ushield_target {
+    uint32_t cid;
+    uint32_t pid;
 };
 
 #endif // USHIELD_UAPI_H

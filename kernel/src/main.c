@@ -1,15 +1,12 @@
-#include "linux/timekeeping.h"
-.#include "asm-generic/errno-base.h"
-#include "linux/compiler.h"
-#include "linux/gfp_types.h"
-#include "linux/seqlock.h"
-#include <string.h>
 #define pr_fmt(fmt) "[µShield] " fmt
 
+#include <asm-generic/errno-base.h>
 #include <linux/cdev.h>
+#include <linux/compiler.h>
 #include <linux/cred.h>
 #include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/gfp_types.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -22,12 +19,13 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 
 #include "../../include/ushield_uapi.h"
 
-    MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("tralsesec");
 MODULE_DESCRIPTION("µShield Ring 0 Sandbox & Telemetry Module");
 MODULE_VERSION("0.1");
@@ -50,7 +48,7 @@ static struct ushield_ring_buffer *ring_buf = NULL;
 static struct ushield_registry registry;
 
 #define cp current->pid
-#define master registry->master_daemon_pid
+#define master registry.master_daemon_pid
 
 //////////////////////////////////////////
 /// Event management
@@ -115,23 +113,37 @@ ushield_produce_event_fmt(ushield_event_type_t event_type, uint32_t cid, uint32_
 static inline const char *__event_to_string(ushield_event_type_t event) {
     const char *action = "???";
     switch (event) {
-    case USEC_(REGISTER):
-        action = "register";
+    case USEC_(CREATE):
+    case USEP_(CREATE):
+        action = "create";
         break;
 
     case USEC_(START):
+    case USEP_(START):
         action = "start";
         break;
 
+    case USEC_(PAUSE):
+    case USEP_(PAUSE):
+        action = "pause";
+        break;
+
     case USEC_(STOP):
+    case USEP_(STOP):
         action = "stop";
         break;
 
-    case USEC_(UNREGISTER):
-        action = "unregister";
+    case USEC_(DELETE):
+        action = "delete";
+        break;
+
+    case USEC_(DUMP):
+    case USEP_(DUMP):
+        action = "dump";
         break;
 
     case USEC_(CONFIGURE):
+    case USEP_(CONFIGURE):
         action = "configure";
         break;
 
@@ -175,6 +187,67 @@ static inline const char *__resource_to_string(ushield_resource_t resource) {
     return rsrc;
 }
 
+/* Adds new rule by inserting rule into array (moves all elements at index to +1). For performance:
+ * if the target rule is already set to 0, we just overwrite it. __configure_rule_del
+ * sets elements to 0 instead of actually removing them for performance. So if you delete a rule,
+ * make sure to add at the same index if possible! */
+static inline int __configure_rule_add(uint32_t rule_id, uint32_t *rules_count,
+                                       ushield_rule_t *rules[], ushield_rule_t *rule) {
+    unsigned long flags;
+    int status = 0;
+    spin_lock_irqsave(&registry.lock, flags);
+
+    if (rule_id > *rules_count) {
+        status = -ESRCH;
+        goto end;
+    }
+
+    if (*rules_count >= USHIELD_MAX_RULES) {
+        status = -ENOMEM;
+        goto end;
+    }
+
+    // Fast path - for whatever reason rule is empty
+    if (rules[rule_id]) {
+        // TODO: maybe we should validate the rule first; this is user input!
+        rules[rule_id] = rule;
+        goto end;
+    }
+
+    // Make space for rule and insert!
+    for (size_t i = *rules_count; i >= rule_id; i--) {
+        rules[i + 1] = rules[i];
+    }
+
+    rules[rule_id] = rule;
+    (*rules_count)++;
+
+end:
+    spin_unlock_irqrestore(&registry.lock, flags);
+    return status;
+}
+
+/* For performance: it does NOT delete the object and move all elements back by one. It just sets it
+ * to 0. */
+static inline int __configure_rule_del(uint32_t rule_id, uint32_t *rules_count,
+                                       ushield_rule_t *rules[]) {
+    int status = 0;
+    unsigned long flags;
+    spin_lock_irqsave(&registry.lock, flags);
+
+    if (!rules_count || !*rules_count || rule_id > *rules_count) {
+        status = -ESRCH;
+        goto end;
+    }
+
+    // For performance: just set to 0. Can be overwritten later.
+    rules[rule_id] = 0;
+
+end:
+    spin_unlock_irqrestore(&registry.lock, flags);
+    return status;
+}
+
 //////////////////////////////////////////
 /// Process management
 //////////////////////////////////////////
@@ -193,10 +266,36 @@ static bool ushield_process_is_alive(pid_t pid) {
     return alive;
 }
 
-/* Searches for Process' index (pid) by vpid in Containers! */
+/* Searches for Process' index (pid) by vpid in Containers! Returns 0 if found and sets cid and pid
+ * to valid numbers; returns -ESRCH if nothing found and doesn't update cid and pid. */
 static int ushield_process_find_idx(pid_t vpid, uint32_t *cid, uint32_t *pid) {
-    // TODO: impl.
-    return 0;
+    int status = -ESRCH;
+
+    unsigned long flags;
+    spin_lock_irqsave(&registry.lock, flags);
+
+    for (size_t c = 0; c < registry.containers_count; c++) {
+        ushield_container_t *container = registry.containers[c];
+        if (!container)
+            continue;
+
+        for (size_t p = 0; p < container->processes_count; p++) {
+            ushield_process_t *process = container->processes[p];
+            if (!process)
+                continue;
+
+            if (process->pid == vpid) {
+                status = 0;
+                *cid = c;
+                *pid = p;
+                goto end;
+            }
+        }
+    }
+
+end:
+    spin_unlock_irqrestore(&registry.lock, flags);
+    return status;
 }
 
 /*
@@ -234,21 +333,16 @@ static int ushield_process_security_check(uint32_t cid, uint32_t pid,
     if (cp == master || cp == container->owner || cp == process->owner)
         goto end;
 
-    uint8_t p = 0;
+    uint8_t p = USHIELD_RES_MGMT;
 
-    switch (event) {
+    switch (event_type) {
     case USEP_(START):
     case USEP_(STOP):
-        if (resource != USHIELD_RES_MGMT) {
-            status = 1;
-            goto end; // Prevents wrong arguments turning into false alarms!
-        }
-
-        p = USHIELD_PERM_XO;
+        p |= USHIELD_PERM_XO;
         break;
 
     case USEP_(CONFIGURE):
-        p = USHIELD_PERM_WO;
+        p |= USHIELD_PERM_WO;
         break;
 
     default:
@@ -256,7 +350,6 @@ static int ushield_process_security_check(uint32_t cid, uint32_t pid,
         unreachable();
     }
 
-    p |= resource;
     if (container->permissions & p || process->permissions & p)
         goto end;
 
@@ -271,6 +364,14 @@ end:
     return status;
 }
 
+#define ushield_process_security_check(cid, pid, event_type)                                       \
+    ushield_process_security_check(cid, pid, USHIELD_EVENT_PROCESS_##event_type)
+
+static int ushield_process_apply_rules(uint32_t cid, uint32_t pid) {
+    // TODO: impl.
+    return 0;
+}
+
 /* Adds new rule by inserting rule into array (moves all elements at index to +1). For performance:
  * if the target rule is already set to 0, we just overwrite it. ushield_process_configure_rule_del
  * sets elements to 0 instead of actually removing them for performance. So if you delete a rule,
@@ -282,39 +383,10 @@ static int ushield_process_configure_rule_add(uint32_t cid, uint32_t pid, uint32
     if (ushield_process_security_check(cid, pid, CONFIGURE) < 0)
         return -EPERM;
 
-    unsigned long flags;
-    int status = 0;
-    spin_lock_irqsave(&registry.lock, flags);
-
     ushield_process_t *process = registry.containers[cid]->processes[pid];
+    int status = __configure_rule_add(rule_id, &process->rules_count, process->rules, rule);
 
-    if (rule_id > process->rules_count) {
-        status = -ESRCH;
-        goto end;
-    }
-
-    if (process->rules_count >= USHIELD_MAX_RULES) {
-        status = -ENOMEM;
-        goto end;
-    }
-
-    // Fast path - for whatever reason rule is empty
-    if (!process->rules[rule_id]) {
-        // TODO: maybe we should validate the rule first; this is user input!
-        process->rules[rule_id] = rule;
-        goto end;
-    }
-
-    // Make space for rule and insert!
-    for (size_t i = process->rules_count; i >= rule_id; i++) {
-        process->rules[i + 1] = process->rules[i];
-    }
-
-    process->rules[rule_id] = rule;
-    process->rules_count++;
-
-end:
-    spin_unlock_irqrestore(&registry.lock, flags);
+    ushield_process_apply_rules(cid, pid);
     return status;
 }
 
@@ -324,22 +396,17 @@ static int ushield_process_configure_rule_del(uint32_t cid, uint32_t pid, uint32
     if (ushield_process_security_check(cid, pid, CONFIGURE) < 0)
         return -EPERM;
 
-    int status = 0;
-    unsigned long flags;
-    spin_lock_irqsave(&registry.lock, flags);
-
     ushield_process_t *process = registry.containers[cid]->processes[pid];
-    if (process->rules_count == 0 || rule_id > process->rules_count) {
-        status = -ESRCH;
-        goto end;
-    }
 
-    // For performance: just set to 0. Can be overwritten later.
-    process->rules[rule_id] = 0;
+    int status = __configure_rule_del(rule_id, &process->rules_count, process->rules);
 
-end:
-    spin_unlock_irqrestore(&registry.lock, flags);
+    ushield_process_apply_rules(cid, pid);
     return status;
+}
+
+static int ushield_process_create(uint32_t cid, uint32_t pid) {
+    // TODO: impl.
+    return 0;
 }
 
 static int ushield_process_start(uint32_t cid, uint32_t pid) {
@@ -361,7 +428,7 @@ static int ushield_process_start(uint32_t cid, uint32_t pid) {
 
     if (!info->start_ns) {
         // TODO: implement real start.
-        info->start_ns = kernel_get_ns();
+        info->start_ns = ktime_get_ns();
         info->active = true;
         goto end;
     }
@@ -376,8 +443,8 @@ end:
     return status;
 }
 
-static int ushield_process_stop(uint32_t cid, uint32_t pid) {
-    if (ushield_process_security_check(cid, pid, STOP) < 0)
+static int ushield_process_pause(uint32_t cid, uint32_t pid) {
+    if (ushield_process_security_check(cid, pid, PAUSE) < 0)
         return -EPERM;
 
     // TODO: due to small race window here,
@@ -387,12 +454,11 @@ static int ushield_process_stop(uint32_t cid, uint32_t pid) {
     spin_lock_irqsave(&registry.lock, flags);
 
     ushield_process_t *process = registry.containers[cid]->processes[pid];
-    const pid_t target_pid = process->target_pid;
     struct task_struct *task;
     int status = -ESRCH;
 
     rcu_read_lock();
-    task = pid_task(find_vpid(target_pid), PIDTYPE_PID);
+    task = pid_task(find_vpid(process->pid), PIDTYPE_PID);
     if (task) {
         get_task_struct(task);
         rcu_read_unlock();
@@ -400,7 +466,8 @@ static int ushield_process_stop(uint32_t cid, uint32_t pid) {
         status = send_sig(SIGSTOP, task, 0);
         put_task_struct(task);
         ushield_produce_event_process(USHIELD_EVENT_PROCESS_STOP, cid, pid,
-                                      "Target process PID %d PAUSED (SIGSTOP sent)\n", target_pid);
+                                      "Target process PID %d PAUSED (SIGSTOP sent)\n",
+                                      process->pid);
 
         ushield_exec_info_t *info = &process->info;
         info->active = false;
@@ -413,6 +480,16 @@ static int ushield_process_stop(uint32_t cid, uint32_t pid) {
 end:
     spin_unlock_irqrestore(&registry.lock, flags);
     return status;
+}
+
+static int ushield_process_stop(uint32_t cid, uint32_t pid) {
+    // TODO: impl.
+    return 0;
+}
+
+static int ushield_process_dump(uint32_t cid, uint32_t pid) {
+    // TODO: impl.
+    return 0;
 }
 
 //////////////////////////////////////////
@@ -448,35 +525,35 @@ static int ushield_container_security_check(uint32_t cid, ushield_event_type_t e
     if (cp == master || cp == container->owner)
         goto end;
 
-    uint8_t p = 0;
+    uint8_t p = resource;
 
     switch (event) {
-    case USEC_(UNREGISTER):
+    case USEC_(DELETE):
     case USEC_(START):
     case USEC_(STOP):
-    case USEC_(REGISTER): // Register doesn't even make sense here. NVM.
+    case USEC_(CREATE): // CREATE doesn't even make sense here. NVM.
         if (resource != USHIELD_RES_MGMT) {
             status = 1;
             goto end; // Prevents wrong arguments turning into false alarms!
         }
 
-        p = USHIELD_PERM_XO;
+        p |= USHIELD_PERM_XO;
         break;
     case USEC_(READ):
-        p = USHIELD_PERM_RO;
+    case USEC_(DUMP):
+        p |= USHIELD_PERM_RO;
         break;
     case USEC_(WRITE):
-        p = USHIELD_PERM_WO;
+        p |= USHIELD_PERM_WO;
         break;
     case USEC_(EXECUTE):
-        p = USHIELD_PERM_XO;
+        p |= USHIELD_PERM_XO;
         break;
     default:
         // TODO: dangerous. Requires skill.
         unreachable();
     }
 
-    p |= resource;
     if (container->permissions & p)
         goto end;
 
@@ -494,27 +571,57 @@ end:
     ushield_container_security_check(cid, USHIELD_EVENT_CONTAINER_##event_name,                    \
                                      USHIELD_RES_##resource)
 
-static int ushield_container_register(ushield_container_t *container) {
+static int ushield_container_apply_rules(uint32_t cid) {
+    // TODO: impl.
+    return 0;
+}
+
+static int ushield_container_configure_rule_add(uint32_t cid, uint32_t rule_id,
+                                                ushield_rule_t *rule) {
+    if (ushield_container_security_check(cid, CONFIGURE, MGMT) < 0)
+        return -EPERM;
+
+    ushield_container_t *container = registry.containers[cid];
+
+    int status = __configure_rule_add(rule_id, &container->rules_count, container->rules, rule);
+
+    ushield_container_apply_rules(cid);
+    return status;
+}
+
+static int ushield_container_configure_rule_del(uint32_t cid, uint32_t rule_id,
+                                                ushield_rule_t *rule) {
+    if (ushield_container_security_check(cid, CONFIGURE, MGMT) < 0)
+        return -EPERM;
+
+    ushield_container_t *container = registry.containers[cid];
+
+    int status = __configure_rule_del(rule_id, &container->rules_count, container->rules);
+
+    ushield_container_apply_rules(cid);
+    return status;
+}
+
+static int ushield_container_create(ushield_container_t *container) {
     // Fast path: id already exists? => nothing to do.
     if (container->id < registry.containers_count && registry.containers[container->id])
         return 0;
 
-    if (ushield_container_security_check(container->id, REGISTER, MGMT) < 0)
+    if (ushield_container_security_check(container->id, CREATE, MGMT) < 0)
         return -EPERM;
 
     if (registry.containers_count >= USHIELD_MAX_CONTAINERS)
         return -ENOMEM;
 
-    unsigned long flags;
-    spin_lock_irqsave(&registry.lock, flags);
     size_t size = sizeof(ushield_container_t);
-    void *ptr = kmalloc(size, GFP_KERNEL);
+    ushield_container_t *ptr = kmalloc(size, GFP_KERNEL);
     if (!ptr) {
-        spin_unlock_irqrestore(&registry.lock, flags);
         return -ENOMEM;
     }
     memcpy(ptr, container, size);
 
+    unsigned long flags;
+    spin_lock_irqsave(&registry.lock, flags);
     registry.containers[registry.containers_count] = ptr;
     registry.containers_count++;
     spin_unlock_irqrestore(&registry.lock, flags);
@@ -534,9 +641,14 @@ static int ushield_container_start(ushield_container_t *container) {
 
     // Register if unregistered.
     // TODO: remove? Same for unregister > stop. Keep or remove?
-    ushield_container_register(container);
+    ushield_container_create(container);
 
     // TODO: implement container start / resume mechanism.
+    return 0;
+}
+
+static int ushield_container_pause(uint32_t cid) {
+    // TODO: impl.
     return 0;
 }
 
@@ -547,12 +659,12 @@ static int ushield_container_stop(uint32_t cid) {
 
     ushield_container_t *container = registry.containers[cid];
     for (size_t i = 0; i < container->processes_count; i++)
-        ushield_process_stop(container->processes[i]->pid);
+        ushield_process_stop(container->id, container->processes[i]->pid);
     return 0;
 }
 
-static int ushield_container_unregister(uint32_t cid) {
-    if (ushield_container_security_check(cid, UNREGISTER, MGMT) < 0) {
+static int ushield_container_delete(uint32_t cid) {
+    if (ushield_container_security_check(cid, DELETE, MGMT) < 0) {
         return -EPERM;
     }
 
@@ -571,9 +683,26 @@ static int ushield_container_unregister(uint32_t cid) {
     return 0;
 }
 
-static int ushield_container_register_process(void) { return 0; }
-static int ushield_container_unregister_process(void) { return 0; }
-static int ushield_container_self_seal(void) { return 0; }
+static int ushield_container_dump(uint32_t cid) {
+    // TODO: impl.
+    return 0;
+}
+static int ushield_container_self_seal(uint32_t cid) {
+    // TODO: impl.
+    return 0;
+}
+static int ushield_container_read(uint32_t cid) {
+    // TODO: impl.
+    return 0;
+}
+static int ushield_container_write(uint32_t cid) {
+    // TODO: impl.
+    return 0;
+}
+static int ushield_container_execute(uint32_t cid) {
+    // TODO: impl.
+    return 0;
+}
 
 //////////////////////////////////////////
 /// Device management
@@ -591,7 +720,7 @@ static int ushield_release(struct inode *inode, struct file *file) {
     spin_lock_irqsave(&registry.lock, flags);
 
     for (size_t i = 0; i < registry.containers_count; i++)
-        ushield_container_unregister(i);
+        ushield_container_stop(i);
 
     spin_unlock_irqrestore(&registry.lock, flags);
 
@@ -619,7 +748,6 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 
     case USHIELD_IOC_REGISTER_SUPERVISOR: {
         pid_t pid = current->pid;
-        pid_t master = registry.master_daemon_pid;
         _Bool active = ushield_process_is_alive(master);
 
         if (current_cred()->uid.val != 0) {
@@ -660,13 +788,13 @@ static long ushield_ioctl(struct file *file, unsigned int cmd, unsigned long arg
         if (copy_from_user(&cid, (uint32_t __user *)arg, sizeof(cid)))
             return -EFAULT;
 
-        if (ushield_container_security_check(cid, REGISTER_PROCESS, PROC) < 0)
+        if (ushield_container_security_check(cid, EXECUTE, PROC) < 0)
             return -EPERM;
 
         if (registry.containers[cid]->processes_count >= USHIELD_MAX_CHILDREN)
             return -ENOMEM;
 
-        return ushield_container_self_seal();
+        return ushield_container_self_seal(cid);
     }
 
     case USHIELD_IOC_REGISTER_TARGET: {
@@ -968,17 +1096,17 @@ static int __init ushield_init(void) {
 
     pr_info("Initializing Ring 0 driver...\n");
 
-    spin_lock_init(&registry.lock);
-    registry.count = 0;
-    registry.rule_count = 0;
-    registry.master_daemon_pid = 0;
-
     ring_buf = kmalloc(sizeof(struct ushield_ring_buffer), GFP_KERNEL);
     if (!ring_buf) {
         pr_err("Failed to allocate ring buffer memory\n");
         return -ENOMEM;
     }
     memset(ring_buf, 0, sizeof(struct ushield_ring_buffer));
+
+    spin_lock_init(&registry.lock);
+    registry.count = 0;
+    registry.rule_count = 0;
+    registry.master_daemon_pid = 0;
     ring_buf->capacity = USHIELD_RING_CAPACITY;
 
     ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
