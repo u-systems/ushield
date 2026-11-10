@@ -11,6 +11,7 @@
 #endif
 
 #define USHIELD_IOC_MAGIC 's'
+#define USIM USHIELD_IO_MAGIC
 #define USHIELD_MAX_PATH 256
 #define USHIELD_MAX_RULES 4096
 #define USHIELD_MAX_DELTA_LAYERS 8
@@ -53,26 +54,26 @@ typedef enum ushield_base_type {
 } ushield_base_type_t;
 
 /* Delta Operations */
-typedef enum ushield_file_op {
+typedef enum ushield_op_file {
     USHIELD_FILE_CREATE = 1,      // Create new file
     USHIELD_FILE_DELETE = 2,      // Delete file
     USHIELD_FILE_PERMISSIONS = 3, // Change file permissions
     USHIELD_FILE_MOUNT = 4,       // Mount file
     USHIELD_FILE_MASK = 5         // Mask file (hide from container / process)
-} ushield_file_op_t;
+} ushield_op_file_t;
 
-typedef enum ushield_net_op {
+typedef enum ushield_op_net {
     USHIELD_NET_CREATE = 1, // Create new net
     USHIELD_NET_DELETE = 2, // Delete net
     USHIELD_NET_BRIDGE = 3, // Bridge net to host
-} ushield_net_op_t;
+} ushield_op_net_t;
 
-typedef enum ushield_env_op {
+typedef enum ushield_op_env {
     USHIELD_ENV_SET = 1,      // Set variable
     USHIELD_ENV_UNSET = 2,    // Strip variable
     USHIELD_ENV_MIRROR = 3,   // Mirror variable from host (stays updated)
     USHIELD_ENV_UNMIRROR = 4, // Un-mirror variable from host
-} ushield_env_op_t;
+} ushield_op_env_t;
 
 /* Generic Stackable Edit Delta Layer Header */
 typedef struct ushield_delta_layer {
@@ -114,6 +115,8 @@ typedef struct ushield_rule {
     ushield_rule_handler_fn handler_fn;
 } ushield_rule_t;
 
+#define ushield_buffer char[USHIELD_MAX_PATH] // Just a buffer.
+
 typedef struct ushield_exec_info {
     _Bool active;      /* Currently running? */
     uint64_t start_ns; /* Timestamp of registration */
@@ -147,20 +150,6 @@ typedef struct ushield_container {
     ushield_rule_t *rules[USHIELD_MAX_RULES];                     // Rules.
 } ushield_container_t;
 
-/* IOCTL Command Definitions */
-#define USHIELD_IOC_PING _IO(USHIELD_IOC_MAGIC, 1)
-#define USHIELD_IOC_GET_VERSION _IOR(USHIELD_IOC_MAGIC, 2, uint32_t)
-#define USHIELD_IOC_REGISTER_SUPERVISOR _IO(USHIELD_IOC_MAGIC, 3)
-#define USHIELD_IOC_SEAL_SELF _IOW(USHIELD_IOC_MAGIC, 4, uint32_t)
-#define USHIELD_IOC_REGISTER_TARGET _IOW(USHIELD_IOC_MAGIC, 5, struct ushield_target_config)
-#define USHIELD_IOC_UNREGISTER_TARGET _IOW(USHIELD_IOC_MAGIC, 6, struct ushield_target_config)
-#define USHIELD_IOC_GET_POLICY _IOWR(USHIELD_IOC_MAGIC, 7, struct ushield_target_config)
-#define USHIELD_IOC_PAUSE_TARGET _IOW(USHIELD_IOC_MAGIC, 8, uint32_t)
-#define USHIELD_IOC_RESUME_TARGET _IOW(USHIELD_IOC_MAGIC, 9, uint32_t)
-#define USHIELD_IOC_PUSH_DELTA _IOW(USHIELD_IOC_MAGIC, 10, struct ushield_delta_layer)
-#define USHIELD_IOC_CLEAR_DELTAS _IOW(USHIELD_IOC_MAGIC, 11, char[USHIELD_MAX_PATH])
-#define USHIELD_IOC_PATCH_RESOURCE _IOWR(USHIELD_IOC_MAGIC, 12, struct ushield_resource_patch)
-
 /* Telemetry Ring Buffer Definitions */
 #define USHIELD_RING_CAPACITY 1024
 #define USHIELD_EVENT_MESSAGE_SIZE 256
@@ -172,28 +161,30 @@ typedef enum ushield_event_type {
     USHIELD_EVENT_CONTAINER_STOP = 3,
     USHIELD_EVENT_CONTAINER_DELETE = 4,
     USHIELD_EVENT_CONTAINER_DUMP = 5,
-    USHIELD_EVENT_CONTAINER_CONFIGURE = 6,
-    USHIELD_EVENT_CONTAINER_READ = 7,
-    USHIELD_EVENT_CONTAINER_WRITE = 8,
-    USHIELD_EVENT_CONTAINER_EXECUTE = 9,
+    USHIELD_EVENT_CONTAINER_CONFIGURE = 6,   // Set *all* rules to provided ushield_rule_t[]
+    USHIELD_EVENT_CONTAINER_RULE_ADD = 7,    // Add *one* rule at index *i*
+    USHIELD_EVENT_CONTAINER_RULE_DELETE = 8, // Delete *one* rule at index *i*
+    USHIELD_EVENT_CONTAINER_RULE_SET = 9,    // Set *one* rule at index *i* to new ushield_rule_t
+    USHIELD_EVENT_CONTAINER_READ = 10,
+    USHIELD_EVENT_CONTAINER_WRITE = 11,
+    USHIELD_EVENT_CONTAINER_EXECUTE = 12,
 
-    USHIELD_EVENT_PROCESS_CREATE = 10,
-    USHIELD_EVENT_PROCESS_START = 11,
-    USHIELD_EVENT_PROCESS_PAUSE = 12,
-    USHIELD_EVENT_PROCESS_STOP = 13,
-    USHIELD_EVENT_PROCESS_DUMP = 14,
-    USHIELD_EVENT_PROCESS_CONFIGURE = 15,
+    USHIELD_EVENT_PROCESS_CREATE = 20,
+    USHIELD_EVENT_PROCESS_START = 21,
+    USHIELD_EVENT_PROCESS_PAUSE = 22,
+    USHIELD_EVENT_PROCESS_STOP = 23,
+    USHIELD_EVENT_PROCESS_DUMP = 24,
+    USHIELD_EVENT_PROCESS_CONFIGURE = 25,
 
-    USHIELD_EVENT_MASTER_REGISTER = 21,
-    USHIELD_EVENT_MASTER_UNREGISTER = 22,
+    USHIELD_EVENT_MASTER_REGISTER = 31,
+    USHIELD_EVENT_MASTER_UNREGISTER = 32,
 
-    USHIELD_EVENT_REQ_PING = 31,
-    USHIELD_EVENT_REQ_VERSION = 32,
-    USHIELD_EVENT_REQ_POLICY = 33,
-    USHIELD_EVENT_REQ_OPEN_FD = 34,
-    USHIELD_EVENT_REQ_CLOSE_FD = 35,
-    USHIELD_EVENT_REQ_INITIALIZE = 36,
-    USHIELD_EVENT_REQ_UNINITIALIZE = 37,
+    USHIELD_EVENT_REQ_PING = 51,
+    USHIELD_EVENT_REQ_VERSION = 52,
+    USHIELD_EVENT_REQ_OPEN_DEVICE = 53,  // For logging: opened device
+    USHIELD_EVENT_REQ_CLOSE_DEVICE = 54, // For logging: closed device
+    USHIELD_EVENT_REQ_INITIALIZE = 55,   // For logging: module initialized
+    USHIELD_EVENT_REQ_UNINITIALIZE = 56, // For logging: module uninitialized
 
     USHIELD_EVENT_ATTENTION = 99, // Illegal action!
 } ushield_event_type_t;
@@ -227,5 +218,48 @@ struct ushield_target {
     uint32_t cid;
     uint32_t pid;
 };
+
+/* IOCTL Command Definitions */
+#define USHIELD_IOC_CONTAINER_CREATE = _IOW(USIM, USEC_(CREATE), ushield_container_t)
+#define USHIELD_IOC_CONTAINER_START = _IOW(USIM, USEC_(START), uint32_t)
+#define USHIELD_IOC_CONTAINER_PAUSE = _IOW(USIM, USEC_(PAUSE), uint32_t)
+#define USHIELD_IOC_CONTAINER_STOP = _IOW(USIM, USEC_(STOP), uint32_t)
+#define USHIELD_IOC_CONTAINER_DELETE = _IOW(USIM, USEC_(DELETE), uint32_t)
+#define USHIELD_IOC_CONTAINER_DUMP = _IOW(USIM, USEC_(DUMP), uint32_t)
+#define USHIELD_IOC_CONTAINER_CONFIGURE = _IOW(USIM, USEC_(CONFIGURE), ushield_rule_t[])
+#define USHIELD_IOC_CONTAINER_RULE_ADD                                                             \
+    = _IOW(USIM, USEC_(RULE_ADD),                                                                  \
+           ushield_buffer) // Required: container id (uint32_t) then ushield_rule_t
+#define USHIELD_IOC_CONTAINER_RULE_DELETE = _IOW(USIM, USEC_(RULE_DELETE), uint32_t)
+#define USHIELD_IOC_CONTAINER_RULE_SET                                                             \
+    = _IOW(USIM, USEC_(RULE_SET),                                                                  \
+           ushield_buffer) // Required: container id (uint32_t) then ushield_rule_t
+#define USHIELD_IOC_CONTAINER_READ                                                                 \
+    = _IOW(USIM, USEC_(READ), ushield_buffer) // Required: containre id (uint32_t) then
+                                              // ushield_resource_t then ushield_op_* (uint8_t)
+#define USHIELD_IOC_CONTAINER_WRITE                                                                \
+    = _IOW(USIM, USEC_(WRITE), ushield_buffer) // Requires: container id (uint32_t) then
+                                               // ushield_resource_t then ushield_op_* (uint8_t)
+                                               // then rest to write
+#define USHIELD_IOC_CONTAINER_EXECUTE                                                              \
+    = _IOW(USIM, USEC_(EXECUTE),                                                                   \
+           ushield_buffer) // Required: container id (uint32_t) then ushield_resource_t then
+                           // ushield_op_* (uint8_t) then rest to execute
+
+#define USHIELD_IOC_PROCESS_CREATE                                                                 \
+    = _IOW(USIM, USEP_(CREATE),                                                                    \
+           ushield_buffer) // Requires ushield_target then ushield_process_creation_t
+#define USHIELD_IOC_PROCESS_START = _IOW(USIM, USEP_(START), ushield_target)
+#define USHIELD_IOC_PROCESS_PAUSE = _IOW(USIM, USEP_(PAUSE), ushield_target)
+#define USHIELD_IOC_PROCESS_STOP = _IOW(USIM, USEP_(STOP), ushield_target)
+#define USHIELD_IOC_PROCESS_DUMP = _IOW(USIM, USEP_(DUMP), ushield_target)
+#define USHIELD_IOC_PROCESS_CONFIGURE                                                              \
+    = _IOW(USIM, USEP_(CONFIGURE), ushield_buffer) // Requires ushield_target then ushield_rule_t[]
+
+#define USHIELD_IOC_MASTER_REGISTER = _IO(USIM, USEM_(REGISTER))
+#define USHIELD_IOC_MASTER_UNREGISTER = _IO(USIM, USEM_(UNREGISTER))
+
+#define USHIELD_IOC_REQ_PING = _IO(USIM, USER_(PING))
+#define USHIELD_IOC_REQ_VERSION = _IOW(USIM, USER_(VERSION), uint32_t)
 
 #endif // USHIELD_UAPI_H

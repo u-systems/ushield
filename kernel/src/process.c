@@ -1,11 +1,10 @@
-#include "../include/internals.h"
-
-#include "../include/event.h"
 #include "../include/process.h"
-#include "linux/pid.h"
-#include "linux/rcupdate.h"
-#include "linux/sched/signal.h"
-#include "linux/timekeeping.h"
+#include "../include/event.h"
+#include <linux/pid.h>
+#include <linux/rcupdate.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
+#include <linux/timekeeping.h>
 
 /* Process alive? IN and OUTSIDE the container (pid) */
 static bool ushield_process_is_alive(pid_t pid) {

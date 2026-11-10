@@ -1,5 +1,7 @@
 #include "../include/internals.h"
-#include "linux/slab.h"
+
+#include "../include/event.h"
+#include <linux/spinlock.h>
 
 //////////////////////////////////////////
 /// Container management
@@ -23,7 +25,7 @@ static int ushield_container_security_check(uint32_t cid, ushield_event_type_t e
     if (cid > registry.containers_count || !registry.containers[cid]) {
         ushield_produce_event_alarm(
             cid, 0, "PID %d requested action (%s) to resource (%s) of non-existing container %d.\n",
-            current->pid, action, rsrc, cid);
+            cp, action, rsrc, cid);
         status = -ESRCH;
         goto end;
     }

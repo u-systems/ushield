@@ -36,6 +36,10 @@ MODULE_VERSION("0.1");
 #define DEVICE_NAME "ushield"
 #define CLASS_NAME "ushield_class"
 
+/* Global Shared Symbol Definitions */
+struct ushield_registry registry;
+struct ushield_ring_buffer *ring_buf = NULL;
+
 static dev_t dev_num;
 static struct cdev ushield_cdev;
 static struct class *ushield_class;
