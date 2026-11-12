@@ -197,9 +197,9 @@ static int ushield_container_delete(uint32_t cid) {
 
     registry.containers[cid] = registry.containers[last];
     registry.containers[cid]->id = cid;
-    registry.containers[last] = 0;
 
 end:
+    registry.containers[last] = 0;
     registry.containers_count--;
     spin_unlock_irqrestore(&registry.lock, flags);
     return 0;
