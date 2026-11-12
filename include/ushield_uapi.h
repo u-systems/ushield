@@ -235,10 +235,10 @@ struct ushield_target {
     = _IOW(USIM, USEC_(RULE_SET),                                                                  \
            ushield_buffer) // Required: container id (uint32_t) then ushield_rule_t
 #define USHIELD_IOC_CONTAINER_READ                                                                 \
-    = _IOW(USIM, USEC_(READ), ushield_buffer) // Required: containre id (uint32_t) then
+    = _IOW(USIM, USEC_(READ), ushield_buffer) // Required: container id (uint32_t) then
                                               // ushield_resource_t then ushield_op_* (uint8_t)
 #define USHIELD_IOC_CONTAINER_WRITE                                                                \
-    = _IOW(USIM, USEC_(WRITE), ushield_buffer) // Requires: container id (uint32_t) then
+    = _IOW(USIM, USEC_(WRITE), ushield_buffer) // Required: container id (uint32_t) then
                                                // ushield_resource_t then ushield_op_* (uint8_t)
                                                // then rest to write
 #define USHIELD_IOC_CONTAINER_EXECUTE                                                              \

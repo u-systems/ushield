@@ -1,6 +1,7 @@
 #include "../include/internals.h"
 
 #include "../include/event.h"
+#include "../include/process.h"
 #include <linux/spinlock.h>
 
 //////////////////////////////////////////
@@ -22,7 +23,16 @@ static int ushield_container_security_check(uint32_t cid, ushield_event_type_t e
     int status = 0;
     spin_lock_irqsave(&registry.lock, flags);
 
-    if (cid > registry.containers_count || !registry.containers[cid]) {
+    if (registry.containers_count >= USHIELD_MAX_CONTAINERS) {
+        ushield_produce_event_alarm(cid, 0,
+                                    "PID %d requested action (%s) to resource (%s) of container "
+                                    "%d, but reached USHIELD_MAX_CONTAINERS.\n",
+                                    cp, action, rsrc, cid);
+        status = -ENOMEM;
+        goto end;
+    }
+
+    if (cid >= registry.containers_count || !registry.containers[cid]) {
         ushield_produce_event_alarm(
             cid, 0, "PID %d requested action (%s) to resource (%s) of non-existing container %d.\n",
             cp, action, rsrc, cid);
@@ -121,15 +131,9 @@ static int ushield_container_create(ushield_container_t *container) {
     if (ushield_container_security_check(container->id, CREATE, MGMT) < 0)
         return -EPERM;
 
-    if (registry.containers_count >= USHIELD_MAX_CONTAINERS)
+    ushield_container_t *ptr = kmemdup(container, sizeof(*container), GFP_KERNEL);
+    if (!ptr)
         return -ENOMEM;
-
-    size_t size = sizeof(ushield_container_t);
-    ushield_container_t *ptr = kmalloc(size, GFP_KERNEL);
-    if (!ptr) {
-        return -ENOMEM;
-    }
-    memcpy(ptr, container, size);
 
     unsigned long flags;
     spin_lock_irqsave(&registry.lock, flags);
