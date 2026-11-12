@@ -120,7 +120,7 @@ static inline int __configure_rule_add(uint32_t rule_id, uint32_t *rules_count,
     }
 
     // Fast path - for whatever reason rule is empty
-    if (rules[rule_id]) {
+    if (!rules[rule_id]) {
         // TODO: maybe we should validate the rule first; this is user input!
         rules[rule_id] = rule;
         goto end;
@@ -147,7 +147,7 @@ static inline int __configure_rule_del(uint32_t rule_id, uint32_t *rules_count,
     unsigned long flags;
     spin_lock_irqsave(&registry.lock, flags);
 
-    if (!rules_count || !*rules_count || rule_id > *rules_count) {
+    if (!rules_count || !*rules_count || rule_id >= *rules_count) {
         status = -ESRCH;
         goto end;
     }
