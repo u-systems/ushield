@@ -192,9 +192,14 @@ static int ushield_container_delete(uint32_t cid) {
     spin_lock_irqsave(&registry.lock, flags);
     kfree(registry.containers[cid]);
     size_t last = registry.containers_count - 1;
+    if (cid == last) // last container was freed? No need to swap anything!
+        goto end;
+
     registry.containers[cid] = registry.containers[last];
     registry.containers[cid]->id = cid;
     registry.containers[last] = 0;
+
+end:
     registry.containers_count--;
     spin_unlock_irqrestore(&registry.lock, flags);
     return 0;
