@@ -99,7 +99,7 @@ int ushield_container_create(ushield_container_t *container);
  * Requires fully initialized container for unregistered containers,
  * for already registered containers only ushield_container_t->id must be set.
  */
-int ushield_container_start(ushield_container_t *container);
+int ushield_container_start(uint32_t cid);
 int ushield_container_pause(uint32_t cid);
 int ushield_container_stop(uint32_t cid);
 int ushield_container_delete(uint32_t cid);
